@@ -35,6 +35,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
+#include <limits.h>
 #include "sds.h"
 #include "sdsalloc.h"
 
@@ -55,14 +56,16 @@ static inline int sdsHdrSize(char type) {
 }
 
 static inline char sdsReqType(size_t string_size) {
-    if (string_size < 32)
+    if (string_size < 1<<5)
         return SDS_TYPE_5;
-    if (string_size < 0xff)
+    if (string_size < 1<<8)
         return SDS_TYPE_8;
-    if (string_size < 0xffff)
+    if (string_size < 1<<16)
         return SDS_TYPE_16;
-    if (string_size < 0xffffffff)
+#if (LONG_MAX == LLONG_MAX)
+    if (string_size < 1ll<<32)
         return SDS_TYPE_32;
+#endif
     return SDS_TYPE_64;
 }
 
@@ -1087,6 +1090,15 @@ sds sdsjoinsds(sds *argv, int argc, const char *sep, size_t seplen) {
     }
     return join;
 }
+
+/* Wrappers to the allocators used by SDS. Note that SDS will actually
+ * just use the macros defined into sdsalloc.h in order to avoid to pay
+ * the overhead of function calls. Here we define these wrappers only for
+ * the programs SDS is linked to, if they want to touch the SDS internals
+ * even if they use a different allocator. */
+void *sds_malloc(size_t size) { return s_malloc(size); }
+void *sds_realloc(void *ptr, size_t size) { return s_realloc(ptr,size); }
+void sds_free(void *ptr) { s_free(ptr); }
 
 #if defined(SDS_TEST_MAIN)
 #include <stdio.h>
