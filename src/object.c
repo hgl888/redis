@@ -246,11 +246,9 @@ void freeStringObject(robj *o) {
 }
 
 void freeListObject(robj *o) {
-    switch (o->encoding) {
-    case OBJ_ENCODING_QUICKLIST:
+    if (o->encoding == OBJ_ENCODING_QUICKLIST) {
         quicklistRelease(o->ptr);
-        break;
-    default:
+    } else {
         serverPanic("Unknown list encoding type");
     }
 }
@@ -953,7 +951,7 @@ sds getMemoryDoctorReport(void) {
         }
 
         /* Slaves using more than 10 MB each? */
-        if (mh->clients_slaves / numslaves > (1024*1024*10)) {
+        if (numslaves > 0 && mh->clients_slaves / numslaves > (1024*1024*10)) {
             big_slave_buf = 1;
             num_reports++;
         }
