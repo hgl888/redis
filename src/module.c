@@ -95,17 +95,22 @@ typedef struct RedisModulePoolAllocBlock {
  *
  * Note that not all the context structure is always filled with actual values
  * but only the fields needed in a given context. */
+
+struct RedisModuleBlockedClient;
+
 struct RedisModuleCtx {
     void *getapifuncptr;            /* NOTE: Must be the first field. */
     struct RedisModule *module;     /* Module reference. */
     client *client;                 /* Client calling a command. */
+    struct RedisModuleBlockedClient *blocked_client; /* Blocked client for
+                                                        thread safe context. */
     struct AutoMemEntry *amqueue;   /* Auto memory queue of objects to free. */
     int amqueue_len;                /* Number of slots in amqueue. */
     int amqueue_used;               /* Number of used slots in amqueue. */
     int flags;                      /* REDISMODULE_CTX_... flags. */
     void **postponed_arrays;        /* To set with RM_ReplySetArrayLength(). */
     int postponed_arrays_count;     /* Number of entries in postponed_arrays. */
-    void *blocked_privdata;         /* Privdata set when unblocking a clinet. */
+    void *blocked_privdata;         /* Privdata set when unblocking a client. */
 
     /* Used if there is the REDISMODULE_CTX_KEYS_POS_REQUEST flag set. */
     int *keys_pos;
@@ -115,12 +120,13 @@ struct RedisModuleCtx {
 };
 typedef struct RedisModuleCtx RedisModuleCtx;
 
-#define REDISMODULE_CTX_INIT {(void*)(unsigned long)&RM_GetApi, NULL, NULL, NULL, 0, 0, 0, NULL, 0, NULL, NULL, 0, NULL}
+#define REDISMODULE_CTX_INIT {(void*)(unsigned long)&RM_GetApi, NULL, NULL, NULL, NULL, 0, 0, 0, NULL, 0, NULL, NULL, 0, NULL}
 #define REDISMODULE_CTX_MULTI_EMITTED (1<<0)
 #define REDISMODULE_CTX_AUTO_MEMORY (1<<1)
 #define REDISMODULE_CTX_KEYS_POS_REQUEST (1<<2)
 #define REDISMODULE_CTX_BLOCKED_REPLY (1<<3)
 #define REDISMODULE_CTX_BLOCKED_TIMEOUT (1<<4)
+#define REDISMODULE_CTX_THREAD_SAFE (1<<5)
 
 /* This represents a Redis key opened with RM_OpenKey(). */
 struct RedisModuleKey {
@@ -198,10 +204,16 @@ typedef struct RedisModuleBlockedClient {
     void *privdata;     /* Module private data that may be used by the reply
                            or timeout callback. It is set via the
                            RedisModule_UnblockClient() API. */
+    client *reply_client;           /* Fake client used to accumulate replies
+                                       in thread safe contexts. */
 } RedisModuleBlockedClient;
 
 static pthread_mutex_t moduleUnblockedClientsMutex = PTHREAD_MUTEX_INITIALIZER;
 static list *moduleUnblockedClients;
+
+/* We need a mutex that is unlocked / relocked in beforeSleep() in order to
+ * allow thread safe contexts to execute commands at a safe moment. */
+static pthread_mutex_t moduleGIL = PTHREAD_MUTEX_INITIALIZER;
 
 /* --------------------------------------------------------------------------
  * Prototypes
@@ -421,6 +433,7 @@ void moduleFreeContext(RedisModuleCtx *ctx) {
             "calls.",
             ctx->module->name);
     }
+    if (ctx->flags & REDISMODULE_CTX_THREAD_SAFE) freeClient(ctx->client);
 }
 
 /* Helper function for when a command callback is called, in order to handle
@@ -941,10 +954,33 @@ int RM_WrongArity(RedisModuleCtx *ctx) {
     return REDISMODULE_OK;
 }
 
+/* Return the client object the `RM_Reply*` functions should target.
+ * Normally this is just `ctx->client`, that is the client that called
+ * the module command, however in the case of thread safe contexts there
+ * is no directly associated client (since it would not be safe to access
+ * the client from a thread), so instead the blocked client object referenced
+ * in the thread safe context, has a fake client that we just use to accumulate
+ * the replies. Later, when the client is unblocked, the accumulated replies
+ * are appended to the actual client.
+ *
+ * The function returns the client pointer depending on the context, or
+ * NULL if there is no potential client. This happens when we are in the
+ * context of a thread safe context that was not initialized with a blocked
+ * client object. */
+client *moduleGetReplyClient(RedisModuleCtx *ctx) {
+    if (!(ctx->flags & REDISMODULE_CTX_THREAD_SAFE) && ctx->client)
+        return ctx->client;
+    if (ctx->blocked_client)
+        return ctx->blocked_client->reply_client;
+    return NULL;
+}
+
 /* Send an integer reply to the client, with the specified long long value.
  * The function always returns REDISMODULE_OK. */
 int RM_ReplyWithLongLong(RedisModuleCtx *ctx, long long ll) {
-    addReplyLongLong(ctx->client,ll);
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyLongLong(c,ll);
     return REDISMODULE_OK;
 }
 
@@ -952,10 +988,12 @@ int RM_ReplyWithLongLong(RedisModuleCtx *ctx, long long ll) {
  * ReplyWithSimpleString() and ReplyWithError().
  * The function always returns REDISMODULE_OK. */
 int replyWithStatus(RedisModuleCtx *ctx, const char *msg, char *prefix) {
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
     sds strmsg = sdsnewlen(prefix,1);
     strmsg = sdscat(strmsg,msg);
     strmsg = sdscatlen(strmsg,"\r\n",2);
-    addReplySds(ctx->client,strmsg);
+    addReplySds(c,strmsg);
     return REDISMODULE_OK;
 }
 
@@ -998,14 +1036,16 @@ int RM_ReplyWithSimpleString(RedisModuleCtx *ctx, const char *msg) {
  *
  * The function always returns REDISMODULE_OK. */
 int RM_ReplyWithArray(RedisModuleCtx *ctx, long len) {
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
     if (len == REDISMODULE_POSTPONED_ARRAY_LEN) {
         ctx->postponed_arrays = zrealloc(ctx->postponed_arrays,sizeof(void*)*
                 (ctx->postponed_arrays_count+1));
         ctx->postponed_arrays[ctx->postponed_arrays_count] =
-            addDeferredMultiBulkLength(ctx->client);
+            addDeferredMultiBulkLength(c);
         ctx->postponed_arrays_count++;
     } else {
-        addReplyMultiBulkLen(ctx->client,len);
+        addReplyMultiBulkLen(c,len);
     }
     return REDISMODULE_OK;
 }
@@ -1037,6 +1077,8 @@ int RM_ReplyWithArray(RedisModuleCtx *ctx, long len) {
  * that is not easy to calculate in advance the number of elements.
  */
 void RM_ReplySetArrayLength(RedisModuleCtx *ctx, long len) {
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return;
     if (ctx->postponed_arrays_count == 0) {
         serverLog(LL_WARNING,
             "API misuse detected in module %s: "
@@ -1046,7 +1088,7 @@ void RM_ReplySetArrayLength(RedisModuleCtx *ctx, long len) {
             return;
     }
     ctx->postponed_arrays_count--;
-    setDeferredMultiBulkLength(ctx->client,
+    setDeferredMultiBulkLength(c,
             ctx->postponed_arrays[ctx->postponed_arrays_count],
             len);
     if (ctx->postponed_arrays_count == 0) {
@@ -1059,7 +1101,9 @@ void RM_ReplySetArrayLength(RedisModuleCtx *ctx, long len) {
  *
  * The function always returns REDISMODULE_OK. */
 int RM_ReplyWithStringBuffer(RedisModuleCtx *ctx, const char *buf, size_t len) {
-    addReplyBulkCBuffer(ctx->client,(char*)buf,len);
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyBulkCBuffer(c,(char*)buf,len);
     return REDISMODULE_OK;
 }
 
@@ -1067,7 +1111,9 @@ int RM_ReplyWithStringBuffer(RedisModuleCtx *ctx, const char *buf, size_t len) {
  *
  * The function always returns REDISMODULE_OK. */
 int RM_ReplyWithString(RedisModuleCtx *ctx, RedisModuleString *str) {
-    addReplyBulk(ctx->client,str);
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyBulk(c,str);
     return REDISMODULE_OK;
 }
 
@@ -1076,7 +1122,9 @@ int RM_ReplyWithString(RedisModuleCtx *ctx, RedisModuleString *str) {
  *
  * The function always returns REDISMODULE_OK. */
 int RM_ReplyWithNull(RedisModuleCtx *ctx) {
-    addReply(ctx->client,shared.nullbulk);
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
+    addReply(c,shared.nullbulk);
     return REDISMODULE_OK;
 }
 
@@ -1087,8 +1135,10 @@ int RM_ReplyWithNull(RedisModuleCtx *ctx) {
  *
  * The function always returns REDISMODULE_OK. */
 int RM_ReplyWithCallReply(RedisModuleCtx *ctx, RedisModuleCallReply *reply) {
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
     sds proto = sdsnewlen(reply->proto, reply->protolen);
-    addReplySds(ctx->client,proto);
+    addReplySds(c,proto);
     return REDISMODULE_OK;
 }
 
@@ -1099,7 +1149,9 @@ int RM_ReplyWithCallReply(RedisModuleCtx *ctx, RedisModuleCallReply *reply) {
  *
  * The function always returns REDISMODULE_OK. */
 int RM_ReplyWithDouble(RedisModuleCtx *ctx, double d) {
-    addReplyDouble(ctx->client,d);
+    client *c = moduleGetReplyClient(ctx);
+    if (c == NULL) return REDISMODULE_OK;
+    addReplyDouble(c,d);
     return REDISMODULE_OK;
 }
 
@@ -2396,7 +2448,7 @@ robj **moduleCreateArgvFromUserFormat(const char *cmdname, const char *fmt, int 
             argv[argc++] = createStringObject(buf,len);
         } else if (*p == 'l') {
             long ll = va_arg(ap,long long);
-            argv[argc++] = createStringObjectFromLongLong(ll);
+            argv[argc++] = createObject(OBJ_STRING,sdsfromlonglong(ll));
         } else if (*p == 'v') {
              /* A vector of strings */
              robj **v = va_arg(ap, void*);
@@ -3108,6 +3160,17 @@ void RM_LogIOError(RedisModuleIO *io, const char *levelstr, const char *fmt, ...
  * Blocking clients from modules
  * -------------------------------------------------------------------------- */
 
+/* Readable handler for the awake pipe. We do nothing here, the awake bytes
+ * will be actually read in a more appropriate place in the
+ * moduleHandleBlockedClients() function that is where clients are actually
+ * served. */
+void moduleBlockedClientPipeReadable(aeEventLoop *el, int fd, void *privdata, int mask) {
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(mask);
+    UNUSED(privdata);
+}
+
 /* This is called from blocked.c in order to unblock a client: may be called
  * for multiple reasons while the client is in the middle of being blocked
  * because the client is terminated, but is also called for cleanup when a
@@ -3150,6 +3213,8 @@ RedisModuleBlockedClient *RM_BlockClient(RedisModuleCtx *ctx, RedisModuleCmdFunc
     bc->timeout_callback = timeout_callback;
     bc->free_privdata = free_privdata;
     bc->privdata = NULL;
+    bc->reply_client = createClient(-1);
+    bc->reply_client->flags |= CLIENT_MODULE;
     c->bpop.timeout = timeout_ms ? (mstime()+timeout_ms) : 0;
 
     blockClient(c,BLOCKED_MODULE);
@@ -3171,6 +3236,9 @@ int RM_UnblockClient(RedisModuleBlockedClient *bc, void *privdata) {
     pthread_mutex_lock(&moduleUnblockedClientsMutex);
     bc->privdata = privdata;
     listAddNodeTail(moduleUnblockedClients,bc);
+    if (write(server.module_blocked_pipe[1],"A",1) != 1) {
+        /* Ignore the error, this is best-effort. */
+    }
     pthread_mutex_unlock(&moduleUnblockedClientsMutex);
     return REDISMODULE_OK;
 }
@@ -3195,6 +3263,10 @@ void moduleHandleBlockedClients(void) {
     RedisModuleBlockedClient *bc;
 
     pthread_mutex_lock(&moduleUnblockedClientsMutex);
+    /* Here we unblock all the pending clients blocked in modules operations
+     * so we can read every pending "awake byte" in the pipe. */
+    char buf[1];
+    while (read(server.module_blocked_pipe[0],buf,1) == 1);
     while (listLength(moduleUnblockedClients)) {
         ln = listFirst(moduleUnblockedClients);
         bc = ln->value;
@@ -3205,7 +3277,9 @@ void moduleHandleBlockedClients(void) {
         /* Release the lock during the loop, as long as we don't
          * touch the shared list. */
 
-        if (c != NULL && bc->reply_callback != NULL) {
+        /* Call the reply callback if the client is valid and we have
+         * any callback. */
+        if (c && bc->reply_callback) {
             RedisModuleCtx ctx = REDISMODULE_CTX_INIT;
             ctx.flags |= REDISMODULE_CTX_BLOCKED_REPLY;
             ctx.blocked_privdata = bc->privdata;
@@ -3215,10 +3289,41 @@ void moduleHandleBlockedClients(void) {
             moduleHandlePropagationAfterCommandCallback(&ctx);
             moduleFreeContext(&ctx);
         }
+
+        /* Free privdata if any. */
         if (bc->privdata && bc->free_privdata)
             bc->free_privdata(bc->privdata);
+
+        /* It is possible that this blocked client object accumulated
+         * replies to send to the client in a thread safe context.
+         * We need to glue such replies to the client output buffer and
+         * free the temporary client we just used for the replies. */
+        if (c) {
+            if (bc->reply_client->bufpos)
+                addReplyString(c,bc->reply_client->buf,
+                                 bc->reply_client->bufpos);
+            if (listLength(bc->reply_client->reply))
+                listJoin(c->reply,bc->reply_client->reply);
+        }
+        freeClient(bc->reply_client);
+
+        if (c != NULL) {
+            unblockClient(c);
+            /* Put the client in the list of clients that need to write
+             * if there are pending replies here. This is needed since
+             * during a non blocking command the client may receive output. */
+            if (clientHasPendingReplies(c) &&
+                !(c->flags & CLIENT_PENDING_WRITE))
+            {
+                c->flags |= CLIENT_PENDING_WRITE;
+                listAddNodeHead(server.clients_pending_write,c);
+            }
+        }
+
+        /* Free 'bc' only after unblocking the client, since it is
+         * referenced in the client blocking context, and must be valid
+         * when calling unblockClient(). */
         zfree(bc);
-        if (c != NULL) unblockClient(c);
 
         /* Lock again before to iterate the loop. */
         pthread_mutex_lock(&moduleUnblockedClientsMutex);
@@ -3258,13 +3363,81 @@ void *RM_GetBlockedClientPrivateData(RedisModuleCtx *ctx) {
 }
 
 /* --------------------------------------------------------------------------
+ * Thread Safe Contexts
+ * -------------------------------------------------------------------------- */
+
+/* Return a context which can be used inside threads to make Redis context
+ * calls with certain modules APIs. If 'bc' is not NULL then the module will
+ * be bound to a blocked client, and it will be possible to use the
+ * `RedisModule_Reply*` family of functions to accumulate a reply for when the
+ * client will be unblocked. Otherwise the thread safe context will be
+ * detached by a specific client.
+ *
+ * To call non-reply APIs, the thread safe context must be prepared with:
+ *
+ *  RedisModule_ThreadSafeCallStart(ctx);
+ *  ... make your call here ...
+ *  RedisModule_ThreadSafeCallStop(ctx);
+ *
+ * This is not needed when using `RedisModule_Reply*` functions, assuming
+ * that a blocked client was used when the context was created, otherwise
+ * no RedisModule_Reply* call should be made at all.
+ *
+ * TODO: thread safe contexts do not inherit the blocked client
+ * selected database. */
+RedisModuleCtx *RM_GetThreadSafeContext(RedisModuleBlockedClient *bc) {
+    RedisModuleCtx *ctx = zmalloc(sizeof(*ctx));
+    RedisModuleCtx empty = REDISMODULE_CTX_INIT;
+    memcpy(ctx,&empty,sizeof(empty));
+    if (bc) {
+        ctx->blocked_client = bc;
+        ctx->module = bc->module;
+    }
+    ctx->flags |= REDISMODULE_CTX_THREAD_SAFE;
+    /* Even when the context is associated with a blocked client, we can't
+     * access it safely from another thread, so we create a fake client here
+     * in order to keep things like the currently selected database and similar
+     * things. */
+    ctx->client = createClient(-1);
+    return ctx;
+}
+
+/* Release a thread safe context. */
+void RM_FreeThreadSafeContext(RedisModuleCtx *ctx) {
+    moduleFreeContext(ctx);
+    zfree(ctx);
+}
+
+/* Acquire the server lock before executing a thread safe API call.
+ * This is not needed for `RedisModule_Reply*` calls when there is
+ * a blocked client connected to the thread safe context. */
+void RM_ThreadSafeContextLock(RedisModuleCtx *ctx) {
+    DICT_NOTUSED(ctx);
+    moduleAcquireGIL();
+}
+
+/* Release the server lock after a thread safe API call was executed. */
+void RM_ThreadSafeContextUnlock(RedisModuleCtx *ctx) {
+    DICT_NOTUSED(ctx);
+    moduleReleaseGIL();
+}
+
+void moduleAcquireGIL(void) {
+    pthread_mutex_lock(&moduleGIL);
+}
+
+void moduleReleaseGIL(void) {
+    pthread_mutex_unlock(&moduleGIL);
+}
+
+/* --------------------------------------------------------------------------
  * Modules API internals
  * -------------------------------------------------------------------------- */
 
 /* server.moduleapi dictionary type. Only uses plain C strings since
  * this gets queries from modules. */
 
-unsigned int dictCStringKeyHash(const void *key) {
+uint64_t dictCStringKeyHash(const void *key) {
     return dictGenHashFunction((unsigned char*)key, strlen((char*)key));
 }
 
@@ -3298,6 +3471,20 @@ void moduleInitModulesSystem(void) {
     server.loadmodule_queue = listCreate();
     modules = dictCreate(&modulesDictType,NULL);
     moduleRegisterCoreAPI();
+    if (pipe(server.module_blocked_pipe) == -1) {
+        serverLog(LL_WARNING,
+            "Can't create the pipe for module blocking commands: %s",
+            strerror(errno));
+        exit(1);
+    }
+    /* Make the pipe non blocking. This is just a best effort aware mechanism
+     * and we do not want to block not in the read nor in the write half. */
+    anetNonBlock(NULL,server.module_blocked_pipe[0]);
+    anetNonBlock(NULL,server.module_blocked_pipe[1]);
+
+    /* Our thread-safe contexts GIL must start with already locked:
+     * it is just unlocked when it's safe. */
+    pthread_mutex_lock(&moduleGIL);
 }
 
 /* Load all the modules in the server.loadmodule_queue list, which is
@@ -3484,6 +3671,11 @@ void moduleCommand(client *c) {
     }
 }
 
+/* Return the number of registered modules. */
+size_t moduleCount(void) {
+    return dictSize(modules);
+}
+
 /* Register all the APIs we export. Keep this function at the end of the
  * file so that's easy to seek it to add new entries. */
 void moduleRegisterCoreAPI(void) {
@@ -3589,4 +3781,8 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(GetBlockedClientPrivateData);
     REGISTER_API(AbortBlock);
     REGISTER_API(Milliseconds);
+    REGISTER_API(GetThreadSafeContext);
+    REGISTER_API(FreeThreadSafeContext);
+    REGISTER_API(ThreadSafeContextLock);
+    REGISTER_API(ThreadSafeContextUnlock);
 }
